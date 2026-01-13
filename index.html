@@ -2,80 +2,111 @@
 <html lang="zh-TW">
 <head>
     <meta charset="UTF-8">
-    <title>PDF 強效標記工具 (診斷強化版)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF 強效標記工具 (彩色區分+黑白列印強化版)</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <script src="https://unpkg.com/pdf-lib/dist/pdf-lib.min.js"></script>
     <style>
-        body { font-family: sans-serif; margin: 0; background: #323639; color: white; }
+        body { font-family: "Microsoft JhengHei", sans-serif; margin: 0; background: #323639; color: white; }
         #controls { 
             position: sticky; top: 0; z-index: 1000; 
             background: #202124; padding: 15px; 
-            display: flex; gap: 12px; align-items: center; 
+            display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
             box-shadow: 0 2px 10px rgba(0,0,0,0.5);
         }
-        #pdf-container { display: flex; flex-direction: column; align-items: center; padding: 20px; }
-        .page-wrapper { position: relative; margin-bottom: 25px; background: white; border: 1px solid #000; }
+        #pdf-container { display: flex; flex-direction: column; align-items: center; padding: 20px; background: #525659;}
+        .page-wrapper { position: relative; margin-bottom: 25px; background: white; border: 1px solid #000; box-shadow: 0 4px 8px rgba(0,0,0,0.3);}
         canvas { display: block; }
+        
+        /* 網頁預覽的標記樣式 */
         .highlight-box { 
             position: absolute; 
-            background-color: rgba(0, 0, 0, 0.25);
-            border-bottom: 2px solid #000;
+            /* 這裡的背景色會由 JS 動態填入 */
+            border-bottom: 2px solid #000; /* 預覽時也顯示黑底線 */
             pointer-events: none;
-            mix-blend-mode: multiply;
+            mix-blend-mode: multiply; /* 讓文字透出來 */
+            transition: all 0.2s;
         }
-        input, button { padding: 10px; border-radius: 4px; border: 1px solid #555; }
-        .btn-add { background: #3498db; color: white; border: none; font-weight: bold; cursor: pointer; }
-        .btn-export { background: #27ae60; color: white; border: none; font-weight: bold; cursor: pointer; }
-        #status { font-size: 13px; color: #bbb; margin-left: auto; }
+        .highlight-box:hover { border-bottom-width: 4px; }
+
+        input, button { padding: 10px; border-radius: 4px; border: 1px solid #555; font-size: 14px; }
+        input[type="text"] { width: 250px; background: #fff; color: #000; }
+        .btn-add { background: #3498db; color: white; border: none; font-weight: bold; cursor: pointer; transition: background 0.2s;}
+        .btn-add:hover { background: #2980b9; }
+        .btn-export { background: #27ae60; color: white; border: none; font-weight: bold; cursor: pointer; transition: background 0.2s;}
+        .btn-export:hover { background: #219a52; }
+        #status { font-size: 13px; color: #bbb; margin-left: auto; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px;}
     </style>
 </head>
 <body>
 
 <div id="controls">
     <input type="file" id="fileInput" accept="application/pdf">
-    <input type="text" id="keywordInput" placeholder="輸入關鍵字 (例如：合約)">
-    <button class="btn-add" onclick="processSearch()">新增標記</button>
-    <button class="btn-export" onclick="exportPDF()">匯出標記 PDF</button>
-    <span id="status">等待檔案...</span>
+    <input type="text" id="keywordInput" placeholder="輸入關鍵字 (例如：合約,日期)">
+    <button class="btn-add" onclick="processSearch()">新增多色標記</button>
+    <button class="btn-export" onclick="exportPDF()">匯出最終 PDF</button>
+    <span id="status">等待檔案載入...</span>
 </div>
 
 <div id="pdf-container"></div>
 
 <script>
+    // 確保全域變數正確引用
     const pdfjsLib = window['pdfjs-dist/build/pdf'];
     pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
-    const SCALE = 1.5;
+    const SCALE = 1.5; // 螢幕顯示縮放比
     let originalPdfBytes = null;
     let pdfDoc = null;
     let pagesRecords = [];
     let allHighlights = [];
+    let colorIndex = 0; // 用於輪替顏色
 
+    // === 定義顏色色票 ===
+    // 我們選擇中等亮度的顏色，這樣在數位版很清楚，在黑白版也會呈現淺灰色底，不會完全消失
+    const COLOR_PALETTE = [
+        // 格式: { pdf: PDFLib 的 RGB 物件, css: 網頁用的 RGBA 字串 }
+        // 1. 藍色
+        { pdf: {r:0, g:0.7, b:1}, css: "rgba(0, 180, 255, 0.3)" },
+        // 2. 橘紅色
+        { pdf: {r:1, g:0.3, b:0}, css: "rgba(255, 80, 0, 0.3)" },
+        // 3. 綠色
+        { pdf: {r:0, g:0.7, b:0.3}, css: "rgba(0, 180, 80, 0.3)" },
+        // 4. 紫色
+        { pdf: {r:0.7, g:0, b:1}, css: "rgba(180, 0, 255, 0.3)" },
+        // 5. 深黃色 (避開純亮黃，以免黑白列印時消失)
+        { pdf: {r:0.9, g:0.8, b:0}, css: "rgba(230, 200, 0, 0.3)" }
+    ];
+
+    // 1. 檔案載入處理
     document.getElementById("fileInput").addEventListener("change", async (e) => {
         const file = e.target.files[0];
         if (!file) return;
         
+        updateStatus("讀取並渲染 PDF 中...", false);
+        
         try {
-            document.getElementById("status").innerText = "讀取中...";
             originalPdfBytes = await file.arrayBuffer();
-            
-            // 每次載入都使用新的副本以確保安全
+            // 使用 slice(0) 創建副本，防止數據被鎖定
             const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(originalPdfBytes.slice(0)) });
             pdfDoc = await loadingTask.promise;
 
             document.getElementById("pdf-container").innerHTML = "";
             pagesRecords = [];
             allHighlights = [];
+            colorIndex = 0; // 重置顏色計數
 
             for (let i = 1; i <= pdfDoc.numPages; i++) {
                 await renderPage(i);
             }
-            document.getElementById("status").innerText = `已載入 ${pdfDoc.numPages} 頁`;
+            updateStatus(`載入完成，共 ${pdfDoc.numPages} 頁`, false);
         } catch (err) {
-            alert("載入 PDF 失敗: " + err.message);
+            console.error(err);
+            updateStatus("載入失敗，請確認檔案是否受保護。", true);
         }
     });
 
+    // 2. 渲染單一頁面到螢幕
     async function renderPage(pageNum) {
         const page = await pdfDoc.getPage(pageNum);
         const viewport = page.getViewport({ scale: SCALE });
@@ -90,6 +121,7 @@
         canvas.height = viewport.height;
         wrapper.appendChild(canvas);
 
+        // 標記覆蓋層
         const overlay = document.createElement("div");
         overlay.style.cssText = "position:absolute; inset:0; pointer-events:none;";
         wrapper.appendChild(overlay);
@@ -101,58 +133,75 @@
         pagesRecords.push({ pageNum, viewport, textContent, overlay });
     }
 
+    // 3. 搜尋並標記 (核心修改：加入顏色分配)
     function processSearch() {
-        const input = document.getElementById("keywordInput").value.trim();
-        if (!input || !pdfDoc) return;
+        const inputStr = document.getElementById("keywordInput").value.trim();
+        if (!inputStr || !pdfDoc) {
+            alert("請先輸入關鍵字並載入 PDF");
+            return;
+        }
 
-        const keywords = input.split(",").map(k => k.trim().toLowerCase()).filter(k => k);
-        let found = 0;
+        const keywords = inputStr.split(",").map(k => k.trim().toLowerCase()).filter(k => k);
+        if(keywords.length === 0) return;
+
+        // 選取本次搜尋使用的顏色
+        const currentColor = COLOR_PALETTE[colorIndex % COLOR_PALETTE.length];
+        colorIndex++; // 下次搜尋用下一種顏色
+
+        let foundCount = 0;
 
         pagesRecords.forEach(page => {
             page.textContent.items.forEach(item => {
                 const text = item.str.toLowerCase();
-                keywords.forEach(kw => {
-                    if (text.includes(kw)) {
-                        const [x1, y1, x2, y2] = page.viewport.convertToViewportRectangle([
-                            item.transform[4], item.transform[5],
-                            item.transform[4] + item.width, item.transform[5] + item.height
-                        ]);
+                // 檢查是否包含任一關鍵字
+                const isMatch = keywords.some(kw => text.includes(kw));
 
-                        const box = document.createElement("div");
-                        box.className = "highlight-box";
-                        box.style.left = Math.min(x1, x2) + "px";
-                        box.style.top = Math.min(y1, y2) + "px";
-                        box.style.width = Math.abs(x2 - x1) + "px";
-                        box.style.height = Math.abs(y2 - y1) + "px";
-                        page.overlay.appendChild(box);
+                if (isMatch) {
+                    // 轉換為網頁顯示座標
+                    const [x1, y1, x2, y2] = page.viewport.convertToViewportRectangle([
+                        item.transform[4], item.transform[5],
+                        item.transform[4] + item.width, item.transform[5] + item.height
+                    ]);
 
-                        allHighlights.push({
-                            pageIdx: page.pageNum - 1,
-                            x: item.transform[4], y: item.transform[5],
-                            w: item.width, h: item.height
-                        });
-                        found++;
-                    }
-                });
+                    // 建立網頁上的標記方塊
+                    const box = document.createElement("div");
+                    box.className = "highlight-box";
+                    box.style.left = Math.min(x1, x2) + "px";
+                    box.style.top = Math.min(y1, y2) + "px";
+                    box.style.width = Math.abs(x2 - x1) + "px";
+                    box.style.height = Math.abs(y2 - y1) + "px";
+                    // 套用本次選定的顏色
+                    box.style.backgroundColor = currentColor.css;
+                    page.overlay.appendChild(box);
+
+                    // 儲存匯出資料 (包含原始 PDF 座標與顏色資訊)
+                    allHighlights.push({
+                        pageIdx: page.pageNum - 1,
+                        x: item.transform[4], y: item.transform[5],
+                        w: item.width, h: item.height,
+                        colorPdf: currentColor.pdf // 儲存 PDF 格式的顏色
+                    });
+                    foundCount++;
+                }
             });
         });
-        document.getElementById("status").innerText = `已標記 ${found} 處`;
+        updateStatus(`本次新增 ${foundCount} 筆標記 (顏色:${colorIndex})，總計 ${allHighlights.length} 筆`, false);
+        document.getElementById("keywordInput").value = ""; // 清空輸入框方便下次輸入
     }
 
+    // 4. 匯出 PDF (核心修改：繪製彩色塊 + 黑色底線)
     async function exportPDF() {
         if (!allHighlights.length) return alert("尚未標記任何關鍵字");
         
-        document.getElementById("status").innerText = "執行匯出中...";
+        updateStatus("正在產生最終 PDF...", false);
         
         try {
-            // 確保 PDFLib 已載入
-            if (typeof window.PDFLib === 'undefined') {
-                throw new Error("PDF 處理庫載入失敗，請檢查網路連線。");
-            }
+            // 安全檢查：確保 PDFLib 已載入
+            if (typeof window.PDFLib === 'undefined') throw new Error("PDF 處理核心尚未載入完成，請稍後再試。");
 
             const { PDFDocument, rgb, BlendMode } = window.PDFLib;
             
-            // 嘗試載入 PDF
+            // 載入原始 PDF 副本
             const pdfDocLib = await PDFDocument.load(new Uint8Array(originalPdfBytes.slice(0)));
             const pages = pdfDocLib.getPages();
 
@@ -160,38 +209,58 @@
                 if (h.pageIdx >= pages.length) return;
                 const p = pages[h.pageIdx];
                 
-                // 畫灰色底塊
+                // A. 繪製半透明彩色色塊 (用於數位區分，黑白列印時會變淺灰)
+                const colorObj = h.colorPdf;
                 p.drawRectangle({
                     x: h.x, y: h.y, width: h.w, height: h.h,
-                    color: rgb(0.3, 0.3, 0.3), opacity: 0.25,
-                    blendMode: BlendMode.Multiply
+                    // 使用儲存的特定顏色
+                    color: rgb(colorObj.r, colorObj.g, colorObj.b), 
+                    opacity: 0.35, // 稍微提高不透明度，確保黑白列印有底色
+                    blendMode: BlendMode.Multiply // 混合模式確保文字清楚
                 });
 
-                // 畫黑底線
+                // B. 繪製實心黑底線 (黑白列印的保險措施)
+                // 這一條線永遠是純黑色，保證印出來看得到
                 p.drawLine({
                     start: { x: h.x, y: h.y },
                     end: { x: h.x + h.w, y: h.y },
-                    thickness: 1.5, color: rgb(0, 0, 0)
+                    thickness: 1.5, 
+                    color: rgb(0, 0, 0),
+                    opacity: 1
                 });
             });
 
             const pdfBytes = await pdfDocLib.save();
-            const blob = new Blob([pdfBytes], { type: "application/pdf" });
-            const url = URL.createObjectURL(blob);
-            
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = "Highlighted_ReadyToPrint.pdf";
-            a.click();
-            URL.revokeObjectURL(url);
-            
-            document.getElementById("status").innerText = "匯出成功！";
+            downloadBlob(pdfBytes, "ColorHighlight_PrintReady.pdf");
+            updateStatus("匯出成功！檔案已下載。", false);
+
         } catch (err) {
             console.error(err);
-            // 顯示具體錯誤，協助診斷
-            document.getElementById("status").innerText = "匯出失敗";
-            alert("匯出詳細錯誤訊息：\n" + err.message + "\n\n提示：如果是加密或掃描檔，可能無法直接修改。");
+            updateStatus("匯出失敗", true);
+            alert("匯出錯誤詳細資訊：\n" + err.message + "\n\n(如果 PDF 已加密或受保護，將無法匯出)");
         }
+    }
+
+    // 輔助功能：下載檔案
+    function downloadBlob(data, fileName) {
+        const blob = new Blob([data], { type: "application/pdf" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => {
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }, 100);
+    }
+
+    // 輔助功能：更新狀態列
+    function updateStatus(msg, isError) {
+        const status = document.getElementById("status");
+        status.innerText = msg;
+        status.style.color = isError ? "#ff5555" : "#bbb";
     }
 </script>
 
