@@ -2,7 +2,7 @@
 <html lang="zh-TW">
 <head>
 <meta charset="UTF-8">
-<title>PDF 關鍵字螢光筆（可匯出 / 不分大小寫）</title>
+<title>PDF 多關鍵字螢光筆（可匯出列印）</title>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/pdf-lib/dist/pdf-lib.min.js"></script>
@@ -25,8 +25,6 @@ body {
   pointer-events: none;
 }
 .highlight {
-  background: yellow;
-  opacity: 0.45;
   position: absolute;
 }
 </style>
@@ -36,7 +34,7 @@ body {
 
 <div id="controls">
   <input type="file" id="fileInput" accept="application/pdf">
-  <input type="text" id="keyword" placeholder="輸入關鍵字（不分大小寫）">
+  <input type="text" id="keyword" placeholder="輸入關鍵字（逗號分隔，不分大小寫）" style="width:260px">
   <button onclick="search()">搜尋並標記</button>
   <button onclick="exportPDF()">匯出已標記 PDF</button>
 </div>
@@ -47,11 +45,22 @@ body {
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
+// ===== 設定 =====
+const SCALE = 1.5;
+const COLORS = [
+  PDFLib.rgb(1, 1, 0),    // 黃
+  PDFLib.rgb(0, 1, 0),    // 綠
+  PDFLib.rgb(0, 1, 1),    // 青
+  PDFLib.rgb(1, 0.6, 0),  // 橘
+  PDFLib.rgb(1, 0, 1)     // 紫
+];
+
 let pdfDoc = null;
 let originalPdfBytes = null;
-let highlights = [];
 let pagesData = [];
+let highlights = [];
 
+// ===== 載入 PDF =====
 document.getElementById("fileInput").addEventListener("change", async e => {
   const file = e.target.files[0];
   if (!file) return;
@@ -70,7 +79,7 @@ document.getElementById("fileInput").addEventListener("change", async e => {
 
 async function renderPage(pageNum) {
   const page = await pdfDoc.getPage(pageNum);
-  const viewport = page.getViewport({ scale: 1.5 });
+  const viewport = page.getViewport({ scale: SCALE });
 
   const pageDiv = document.createElement("div");
   pageDiv.className = "page";
@@ -97,9 +106,17 @@ async function renderPage(pageNum) {
   pagesData.push({ pageNum, textContent, viewport, textLayer });
 }
 
+// ===== 搜尋與顯示 =====
 function search() {
-  const keyword = document.getElementById("keyword").value.trim().toLowerCase();
-  if (!keyword) return;
+  const raw = document.getElementById("keyword").value;
+  if (!raw) return;
+
+  const keywords = raw
+    .split(",")
+    .map(k => k.trim().toLowerCase())
+    .filter(k => k);
+
+  if (!keywords.length) return;
 
   highlights = [];
 
@@ -107,40 +124,47 @@ function search() {
     data.textLayer.innerHTML = "";
 
     data.textContent.items.forEach(item => {
-      if (item.str.toLowerCase().includes(keyword)) {
+      const text = item.str.toLowerCase();
 
-        const t = pdfjsLib.Util.transform(
-          data.viewport.transform,
-          item.transform
-        );
+      keywords.forEach((kw, index) => {
+        if (text.includes(kw)) {
+          const t = pdfjsLib.Util.transform(
+            data.viewport.transform,
+            item.transform
+          );
 
-        const x = t[4];
-        const y = t[5] - item.height;
-        const w = item.width * data.viewport.scale;
-        const h = item.height * data.viewport.scale;
+          const x = t[4];
+          const y = t[5] - item.height;
+          const w = item.width * data.viewport.scale;
+          const h = item.height * data.viewport.scale;
 
-        // 畫面顯示
-        const div = document.createElement("div");
-        div.className = "highlight";
-        div.style.left = x + "px";
-        div.style.top = y + "px";
-        div.style.width = w + "px";
-        div.style.height = h + "px";
-        data.textLayer.appendChild(div);
+          // 畫面顯示
+          const div = document.createElement("div");
+          div.className = "highlight";
+          div.style.left = x + "px";
+          div.style.top = y + "px";
+          div.style.width = w + "px";
+          div.style.height = h + "px";
+          div.style.background =
+            `rgba(${index * 50 % 255}, 255, 0, 0.35)`;
+          data.textLayer.appendChild(div);
 
-        // 匯出用（轉回 PDF 座標）
-        highlights.push({
-          page: data.pageNum - 1,
-          x: x / data.viewport.scale,
-          y: (data.viewport.height - y - h) / data.viewport.scale,
-          w: w / data.viewport.scale,
-          h: h / data.viewport.scale
-        });
-      }
+          // 匯出用
+          highlights.push({
+            page: data.pageNum - 1,
+            x: x / data.viewport.scale,
+            y: (data.viewport.height - y - h) / data.viewport.scale,
+            w: w / data.viewport.scale,
+            h: h / data.viewport.scale,
+            color: COLORS[index % COLORS.length]
+          });
+        }
+      });
     });
   });
 }
 
+// ===== 匯出 PDF =====
 async function exportPDF() {
   if (!highlights.length) {
     alert("尚未有任何標記");
@@ -156,8 +180,9 @@ async function exportPDF() {
       y: h.y,
       width: h.w,
       height: h.h,
-      color: PDFLib.rgb(1, 1, 0),
-      opacity: 0.4
+      color: h.color,
+      blendMode: PDFLib.BlendMode.Multiply,
+      borderWidth: 0
     });
   });
 
