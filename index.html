@@ -1,176 +1,229 @@
 <!DOCTYPE html>
 <html lang="zh-TW">
 <head>
-<meta charset="UTF-8">
-<title>PDF 多關鍵字螢光筆（累加 / 可匯出列印）</title>
-
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/pdf-lib/dist/pdf-lib.min.js"></script>
-
-<style>
-body { font-family: Arial, sans-serif; margin: 10px; }
-#controls { margin-bottom: 10px; }
-.page { position: relative; margin-bottom: 20px; }
-.textLayer { position: absolute; inset: 0; pointer-events: none; }
-.highlight { position: absolute; }
-</style>
+    <meta charset="UTF-8">
+    <title>PDF 多關鍵字工具 (黑白影印強化版)</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/pdf-lib/dist/pdf-lib.min.js"></script>
+    <style>
+        body { font-family: "Microsoft JhengHei", Arial, sans-serif; margin: 0; background: #525659; }
+        #controls { 
+            position: sticky; top: 0; z-index: 1000; 
+            background: #323639; color: white; padding: 15px; 
+            box-shadow: 0 2px 10px rgba(0,0,0,0.3); display: flex; gap: 10px; align-items: center; 
+        }
+        #pdf-container { display: flex; flex-direction: column; align-items: center; padding: 20px; }
+        .page-wrapper { position: relative; margin-bottom: 25px; box-shadow: 0 5px 15px rgba(0,0,0,0.4); }
+        canvas { display: block; background: white; }
+        /* 標記層 - 預覽用 */
+        .highlight-overlay { 
+            position: absolute; top: 0; left: 0; pointer-events: none; 
+            mix-blend-mode: multiply; /* 模擬螢光筆重疊效果 */
+        }
+        .highlight-box { 
+            position: absolute; 
+            border: 1px dashed rgba(0,0,0,0.3); /* 網頁預覽時增加虛框 */
+            box-sizing: border-box;
+        }
+        input[type="text"] { padding: 8px; border-radius: 4px; border: none; width: 250px; }
+        button { 
+            padding: 8px 16px; border-radius: 4px; border: none; cursor: pointer; 
+            font-weight: bold; transition: 0.2s; 
+        }
+        .btn-add { background: #4caf50; color: white; }
+        .btn-add:hover { background: #45a049; }
+        .btn-export { background: #2196f3; color: white; }
+        .btn-export:hover { background: #1e88e5; }
+        #status { font-size: 0.9em; color: #ccc; }
+    </style>
 </head>
-
 <body>
 
 <div id="controls">
-  <input type="file" id="fileInput" accept="application/pdf">
-  <input type="text" id="keyword" placeholder="輸入關鍵字（逗號分隔）" style="width:260px">
-  <button onclick="search()">新增標記</button>
-  <button onclick="exportPDF()">匯出已標記 PDF</button>
+    <input type="file" id="fileInput" accept="application/pdf">
+    <input type="text" id="keywordInput" placeholder="輸入關鍵字 (多個請用逗號隔開)">
+    <button class="btn-add" onclick="processSearch()">新增標記</button>
+    <button class="btn-export" onclick="exportPDF()">匯出 (影印強化版)</button>
+    <span id="status">請先選擇 PDF 檔案</span>
 </div>
 
 <div id="pdf-container"></div>
 
 <script>
-pdfjsLib.GlobalWorkerOptions.workerSrc =
-  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
-const SCALE = 1.5;
-const COLORS = [
-  PDFLib.rgb(1, 1, 0),
-  PDFLib.rgb(0, 1, 0),
-  PDFLib.rgb(0, 1, 1),
-  PDFLib.rgb(1, 0.6, 0),
-  PDFLib.rgb(1, 0, 1)
-];
+    const DISPLAY_SCALE = 1.5; // 網頁預覽縮放比
+    const COLOR_PALETTE = [
+        { pdf: PDFLib.rgb(1, 1, 0), css: "rgba(255, 255, 0, 0.4)" },      // 黃
+        { pdf: PDFLib.rgb(0, 1, 0), css: "rgba(0, 255, 0, 0.4)" },      // 綠
+        { pdf: PDFLib.rgb(0, 0.8, 1), css: "rgba(0, 204, 255, 0.4)" },  // 藍
+        { pdf: PDFLib.rgb(1, 0.6, 0), css: "rgba(255, 153, 0, 0.4)" },  // 橘
+        { pdf: PDFLib.rgb(1, 0.4, 0.7), css: "rgba(255, 102, 178, 0.4)" } // 粉
+    ];
 
-let pdfDoc = null;
-let originalPdfBytes = null;
-let pagesData = [];
-let highlights = [];
-let usedKeywords = new Set(); // ✅ 已搜尋關鍵字
+    let originalPdfBytes = null;
+    let pdfDoc = null;
+    let pagesRecords = []; // 儲存每一頁的渲染資訊與文字數據
+    let allHighlights = []; // 儲存所有要匯出的標記 (座標對應原始 PDF)
+    let colorCounter = 0;
 
-document.getElementById("fileInput").addEventListener("change", async e => {
-  const file = e.target.files[0];
-  if (!file) return;
+    // 1. 檔案載入邏輯
+    document.getElementById("fileInput").addEventListener("change", async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
 
-  originalPdfBytes = await file.arrayBuffer();
-  pdfDoc = await pdfjsLib.getDocument(originalPdfBytes).promise;
+        document.getElementById("status").innerText = "讀取檔案中...";
+        originalPdfBytes = await file.arrayBuffer();
+        
+        // 清理舊資料
+        document.getElementById("pdf-container").innerHTML = "";
+        pagesRecords = [];
+        allHighlights = [];
+        colorCounter = 0;
 
-  document.getElementById("pdf-container").innerHTML = "";
-  pagesData = [];
-  highlights = [];
-  usedKeywords.clear();
+        const loadingTask = pdfjsLib.getDocument({ data: originalPdfBytes });
+        pdfDoc = await loadingTask.promise;
 
-  for (let i = 1; i <= pdfDoc.numPages; i++) {
-    await renderPage(i);
-  }
-});
-
-async function renderPage(pageNum) {
-  const page = await pdfDoc.getPage(pageNum);
-  const viewport = page.getViewport({ scale: SCALE });
-
-  const pageDiv = document.createElement("div");
-  pageDiv.className = "page";
-  pageDiv.style.width = viewport.width + "px";
-  pageDiv.style.height = viewport.height + "px";
-
-  const canvas = document.createElement("canvas");
-  canvas.width = viewport.width;
-  canvas.height = viewport.height;
-
-  await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-
-  const textLayer = document.createElement("div");
-  textLayer.className = "textLayer";
-
-  pageDiv.appendChild(canvas);
-  pageDiv.appendChild(textLayer);
-  document.getElementById("pdf-container").appendChild(pageDiv);
-
-  const textContent = await page.getTextContent();
-  pagesData.push({ pageNum, textContent, viewport, textLayer });
-}
-
-function search() {
-  const raw = document.getElementById("keyword").value;
-  if (!raw) return;
-
-  const keywords = raw
-    .split(",")
-    .map(k => k.trim().toLowerCase())
-    .filter(k => k && !usedKeywords.has(k));
-
-  if (!keywords.length) return;
-
-  keywords.forEach(k => usedKeywords.add(k));
-
-  pagesData.forEach(data => {
-    data.textContent.items.forEach(item => {
-      const text = item.str.toLowerCase();
-
-      keywords.forEach((kw, index) => {
-        if (text.includes(kw)) {
-          const t = pdfjsLib.Util.transform(
-            data.viewport.transform,
-            item.transform
-          );
-
-          const x = t[4];
-          const y = t[5] - item.height;
-          const w = item.width * data.viewport.scale;
-          const h = item.height * data.viewport.scale;
-
-          // 畫面顯示（累加）
-          const div = document.createElement("div");
-          div.className = "highlight";
-          div.style.left = x + "px";
-          div.style.top = y + "px";
-          div.style.width = w + "px";
-          div.style.height = h + "px";
-          div.style.background = "rgba(255,255,0,0.35)";
-          data.textLayer.appendChild(div);
-
-          // 匯出用
-          highlights.push({
-            page: data.pageNum - 1,
-            x: x / data.viewport.scale,
-            y: (data.viewport.height - y - h) / data.viewport.scale,
-            w: w / data.viewport.scale,
-            h: h / data.viewport.scale,
-            color: COLORS[usedKeywords.size % COLORS.length]
-          });
+        for (let i = 1; i <= pdfDoc.numPages; i++) {
+            await renderPage(i);
         }
-      });
+        document.getElementById("status").innerText = `載入完成，共 ${pdfDoc.numPages} 頁`;
     });
-  });
-}
 
-async function exportPDF() {
-  if (!highlights.length) {
-    alert("尚未有任何標記");
-    return;
-  }
+    // 2. 渲染頁面至畫面上
+    async function renderPage(pageNum) {
+        const page = await pdfDoc.getPage(pageNum);
+        const viewport = page.getViewport({ scale: DISPLAY_SCALE });
 
-  const pdfDocLib = await PDFLib.PDFDocument.load(originalPdfBytes);
-  const pages = pdfDocLib.getPages();
+        const wrapper = document.createElement("div");
+        wrapper.className = "page-wrapper";
+        wrapper.style.width = viewport.width + "px";
+        wrapper.style.height = viewport.height + "px";
 
-  highlights.forEach(h => {
-    pages[h.page].drawRectangle({
-      x: h.x,
-      y: h.y,
-      width: h.w,
-      height: h.h,
-      color: h.color,
-      blendMode: PDFLib.BlendMode.Multiply,
-      borderWidth: 0
-    });
-  });
+        const canvas = document.createElement("canvas");
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+        wrapper.appendChild(canvas);
 
-  const pdfBytes = await pdfDocLib.save();
-  const blob = new Blob([pdfBytes], { type: "application/pdf" });
-  const link = document.createElement("a");
-  link.href = URL.createObjectURL(blob);
-  link.download = "highlighted.pdf";
-  link.click();
-}
+        const overlay = document.createElement("div");
+        overlay.className = "highlight-overlay";
+        overlay.style.width = viewport.width + "px";
+        overlay.style.height = viewport.height + "px";
+        wrapper.appendChild(overlay);
+
+        document.getElementById("pdf-container").appendChild(wrapper);
+
+        const renderCtx = { canvasContext: canvas.getContext("2d"), viewport };
+        await page.render(renderCtx).promise;
+
+        const textContent = await page.getTextContent();
+        pagesRecords.push({
+            pageNum,
+            viewport,
+            textContent,
+            overlayElement: overlay
+        });
+    }
+
+    // 3. 搜尋與標記邏輯 (Bug 修正點：確保累加不消失)
+    function processSearch() {
+        const inputStr = document.getElementById("keywordInput").value.trim();
+        if (!inputStr || !pdfDoc) return;
+
+        const keywords = inputStr.split(",").map(s => s.trim()).filter(s => s.length > 0);
+        let currentMatchCount = 0;
+
+        keywords.forEach(kw => {
+            const theme = COLOR_PALETTE[colorCounter % COLOR_PALETTE.length];
+            
+            pagesRecords.forEach(pageData => {
+                pageData.textContent.items.forEach(item => {
+                    // 檢查文字是否包含關鍵字 (忽略大小寫)
+                    if (item.str.toLowerCase().includes(kw.toLowerCase())) {
+                        
+                        // 計算畫面上預覽用的座標
+                        const [x1, y1, x2, y2] = pageData.viewport.convertToViewportRectangle([
+                            item.transform[4],
+                            item.transform[5],
+                            item.transform[4] + item.width,
+                            item.transform[5] + item.height
+                        ]);
+
+                        const boxX = Math.min(x1, x2);
+                        const boxY = Math.min(y1, y2);
+                        const boxW = Math.abs(x2 - x1);
+                        const boxH = Math.abs(y2 - y1);
+
+                        // 產生 DOM 標記 (累加到 overlay 裡)
+                        const box = document.createElement("div");
+                        box.className = "highlight-box";
+                        box.style.left = boxX + "px";
+                        box.style.top = boxY + "px";
+                        box.style.width = boxW + "px";
+                        box.style.height = boxH + "px";
+                        box.style.backgroundColor = theme.css;
+                        pageData.overlayElement.appendChild(box);
+
+                        // 儲存至匯出清單 (使用原始 PDF 座標)
+                        allHighlights.push({
+                            pageIdx: pageData.pageNum - 1,
+                            x: item.transform[4],
+                            y: item.transform[5],
+                            width: item.width,
+                            height: item.height,
+                            color: theme.pdf
+                        });
+                        currentMatchCount++;
+                    }
+                });
+            });
+            colorCounter++;
+        });
+
+        document.getElementById("status").innerText = `搜尋完成！本次新增 ${currentMatchCount} 處，總計 ${allHighlights.length} 處`;
+        document.getElementById("keywordInput").value = ""; 
+    }
+
+    // 4. 匯出邏輯 (影印強化版)
+    async function exportPDF() {
+        if (allHighlights.length === 0) {
+            alert("尚未有任何標記！");
+            return;
+        }
+
+        try {
+            document.getElementById("status").innerText = "正在優化影印品質並產生 PDF...";
+            const pdfDocLib = await PDFLib.PDFDocument.load(originalPdfBytes);
+            const pages = pdfDocLib.getPages();
+
+            allHighlights.forEach(h => {
+                const currentPage = pages[h.pageIdx];
+                currentPage.drawRectangle({
+                    x: h.x,
+                    y: h.y,
+                    width: h.width,
+                    height: h.height,
+                    color: h.color,
+                    opacity: 0.45, // 調整透明度
+                    blendMode: PDFLib.BlendMode.Multiply,
+                    // --- 黑白影印強化：增加邊框 ---
+                    borderColor: PDFLib.rgb(0, 0, 0), // 黑邊框
+                    borderWidth: 0.8,                 // 邊框寬度
+                });
+            });
+
+            const pdfBytes = await pdfDocLib.save();
+            const blob = new Blob([pdfBytes], { type: "application/pdf" });
+            const link = document.createElement("a");
+            link.href = URL.createObjectURL(blob);
+            link.download = `Highlighted_PrintOptimized.pdf`;
+            link.click();
+            document.getElementById("status").innerText = "匯出成功！";
+        } catch (err) {
+            console.error(err);
+            alert("匯出失敗，請檢查瀏覽器控制台。");
+        }
+    }
 </script>
 
 </body>
