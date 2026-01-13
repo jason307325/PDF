@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<title>PDF 關鍵字螢光筆（可匯出 / 不分大小寫）</title>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdf-lib/dist/pdf-lib.min.js"></script>
+
+<style>
+body {
+  font-family: Arial, sans-serif;
+  margin: 10px;
+}
+#controls {
+  margin-bottom: 10px;
+}
+.page {
+  position: relative;
+  margin-bottom: 20px;
+}
+.textLayer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.highlight {
+  background: yellow;
+  opacity: 0.45;
+  position: absolute;
+}
+</style>
+</head>
+
+<body>
+
+<div id="controls">
+  <input type="file" id="fileInput" accept="application/pdf">
+  <input type="text" id="keyword" placeholder="輸入關鍵字（不分大小寫）">
+  <button onclick="search()">搜尋並標記</button>
+  <button onclick="exportPDF()">匯出已標記 PDF</button>
+</div>
+
+<div id="pdf-container"></div>
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+let pdfDoc = null;
+let originalPdfBytes = null;
+let highlights = [];
+let pagesData = [];
+
+document.getElementById("fileInput").addEventListener("change", async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  originalPdfBytes = await file.arrayBuffer();
+  pdfDoc = await pdfjsLib.getDocument(originalPdfBytes).promise;
+
+  document.getElementById("pdf-container").innerHTML = "";
+  pagesData = [];
+  highlights = [];
+
+  for (let i = 1; i <= pdfDoc.numPages; i++) {
+    await renderPage(i);
+  }
+});
+
+async function renderPage(pageNum) {
+  const page = await pdfDoc.getPage(pageNum);
+  const viewport = page.getViewport({ scale: 1.5 });
+
+  const pageDiv = document.createElement("div");
+  pageDiv.className = "page";
+  pageDiv.style.width = viewport.width + "px";
+  pageDiv.style.height = viewport.height + "px";
+
+  const canvas = document.createElement("canvas");
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+
+  await page.render({
+    canvasContext: canvas.getContext("2d"),
+    viewport
+  }).promise;
+
+  const textLayer = document.createElement("div");
+  textLayer.className = "textLayer";
+
+  pageDiv.appendChild(canvas);
+  pageDiv.appendChild(textLayer);
+  document.getElementById("pdf-container").appendChild(pageDiv);
+
+  const textContent = await page.getTextContent();
+  pagesData.push({ pageNum, textContent, viewport, textLayer });
+}
+
+function search() {
+  const keyword = document.getElementById("keyword").value.trim().toLowerCase();
+  if (!keyword) return;
+
+  highlights = [];
+
+  pagesData.forEach(data => {
+    data.textLayer.innerHTML = "";
+
+    data.textContent.items.forEach(item => {
+      if (item.str.toLowerCase().includes(keyword)) {
+
+        const t = pdfjsLib.Util.transform(
+          data.viewport.transform,
+          item.transform
+        );
+
+        const x = t[4];
+        const y = t[5] - item.height;
+        const w = item.width * data.viewport.scale;
+        const h = item.height * data.viewport.scale;
+
+        // 畫面顯示
+        const div = document.createElement("div");
+        div.className = "highlight";
+        div.style.left = x + "px";
+        div.style.top = y + "px";
+        div.style.width = w + "px";
+        div.style.height = h + "px";
+        data.textLayer.appendChild(div);
+
+        // 匯出用（轉回 PDF 座標）
+        highlights.push({
+          page: data.pageNum - 1,
+          x: x / data.viewport.scale,
+          y: (data.viewport.height - y - h) / data.viewport.scale,
+          w: w / data.viewport.scale,
+          h: h / data.viewport.scale
+        });
+      }
+    });
+  });
+}
+
+async function exportPDF() {
+  if (!highlights.length) {
+    alert("尚未有任何標記");
+    return;
+  }
+
+  const pdfDocLib = await PDFLib.PDFDocument.load(originalPdfBytes);
+  const pages = pdfDocLib.getPages();
+
+  highlights.forEach(h => {
+    pages[h.page].drawRectangle({
+      x: h.x,
+      y: h.y,
+      width: h.w,
+      height: h.h,
+      color: PDFLib.rgb(1, 1, 0),
+      opacity: 0.4
+    });
+  });
+
+  const pdfBytes = await pdfDocLib.save();
+  const blob = new Blob([pdfBytes], { type: "application/pdf" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = "highlighted.pdf";
+  link.click();
+}
+</script>
+
+</body>
+</html>
