@@ -2,31 +2,17 @@
 <html lang="zh-TW">
 <head>
 <meta charset="UTF-8">
-<title>PDF 多關鍵字螢光筆（可匯出列印）</title>
+<title>PDF 多關鍵字螢光筆（累加 / 可匯出列印）</title>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/pdf-lib/dist/pdf-lib.min.js"></script>
 
 <style>
-body {
-  font-family: Arial, sans-serif;
-  margin: 10px;
-}
-#controls {
-  margin-bottom: 10px;
-}
-.page {
-  position: relative;
-  margin-bottom: 20px;
-}
-.textLayer {
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-}
-.highlight {
-  position: absolute;
-}
+body { font-family: Arial, sans-serif; margin: 10px; }
+#controls { margin-bottom: 10px; }
+.page { position: relative; margin-bottom: 20px; }
+.textLayer { position: absolute; inset: 0; pointer-events: none; }
+.highlight { position: absolute; }
 </style>
 </head>
 
@@ -34,8 +20,8 @@ body {
 
 <div id="controls">
   <input type="file" id="fileInput" accept="application/pdf">
-  <input type="text" id="keyword" placeholder="輸入關鍵字（逗號分隔，不分大小寫）" style="width:260px">
-  <button onclick="search()">搜尋並標記</button>
+  <input type="text" id="keyword" placeholder="輸入關鍵字（逗號分隔）" style="width:260px">
+  <button onclick="search()">新增標記</button>
   <button onclick="exportPDF()">匯出已標記 PDF</button>
 </div>
 
@@ -45,22 +31,21 @@ body {
 pdfjsLib.GlobalWorkerOptions.workerSrc =
   "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
-// ===== 設定 =====
 const SCALE = 1.5;
 const COLORS = [
-  PDFLib.rgb(1, 1, 0),    // 黃
-  PDFLib.rgb(0, 1, 0),    // 綠
-  PDFLib.rgb(0, 1, 1),    // 青
-  PDFLib.rgb(1, 0.6, 0),  // 橘
-  PDFLib.rgb(1, 0, 1)     // 紫
+  PDFLib.rgb(1, 1, 0),
+  PDFLib.rgb(0, 1, 0),
+  PDFLib.rgb(0, 1, 1),
+  PDFLib.rgb(1, 0.6, 0),
+  PDFLib.rgb(1, 0, 1)
 ];
 
 let pdfDoc = null;
 let originalPdfBytes = null;
 let pagesData = [];
 let highlights = [];
+let usedKeywords = new Set(); // ✅ 已搜尋關鍵字
 
-// ===== 載入 PDF =====
 document.getElementById("fileInput").addEventListener("change", async e => {
   const file = e.target.files[0];
   if (!file) return;
@@ -71,6 +56,7 @@ document.getElementById("fileInput").addEventListener("change", async e => {
   document.getElementById("pdf-container").innerHTML = "";
   pagesData = [];
   highlights = [];
+  usedKeywords.clear();
 
   for (let i = 1; i <= pdfDoc.numPages; i++) {
     await renderPage(i);
@@ -90,10 +76,7 @@ async function renderPage(pageNum) {
   canvas.width = viewport.width;
   canvas.height = viewport.height;
 
-  await page.render({
-    canvasContext: canvas.getContext("2d"),
-    viewport
-  }).promise;
+  await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
 
   const textLayer = document.createElement("div");
   textLayer.className = "textLayer";
@@ -106,7 +89,6 @@ async function renderPage(pageNum) {
   pagesData.push({ pageNum, textContent, viewport, textLayer });
 }
 
-// ===== 搜尋與顯示 =====
 function search() {
   const raw = document.getElementById("keyword").value;
   if (!raw) return;
@@ -114,15 +96,13 @@ function search() {
   const keywords = raw
     .split(",")
     .map(k => k.trim().toLowerCase())
-    .filter(k => k);
+    .filter(k => k && !usedKeywords.has(k));
 
   if (!keywords.length) return;
 
-  highlights = [];
+  keywords.forEach(k => usedKeywords.add(k));
 
   pagesData.forEach(data => {
-    data.textLayer.innerHTML = "";
-
     data.textContent.items.forEach(item => {
       const text = item.str.toLowerCase();
 
@@ -138,15 +118,14 @@ function search() {
           const w = item.width * data.viewport.scale;
           const h = item.height * data.viewport.scale;
 
-          // 畫面顯示
+          // 畫面顯示（累加）
           const div = document.createElement("div");
           div.className = "highlight";
           div.style.left = x + "px";
           div.style.top = y + "px";
           div.style.width = w + "px";
           div.style.height = h + "px";
-          div.style.background =
-            `rgba(${index * 50 % 255}, 255, 0, 0.35)`;
+          div.style.background = "rgba(255,255,0,0.35)";
           data.textLayer.appendChild(div);
 
           // 匯出用
@@ -156,7 +135,7 @@ function search() {
             y: (data.viewport.height - y - h) / data.viewport.scale,
             w: w / data.viewport.scale,
             h: h / data.viewport.scale,
-            color: COLORS[index % COLORS.length]
+            color: COLORS[usedKeywords.size % COLORS.length]
           });
         }
       });
@@ -164,7 +143,6 @@ function search() {
   });
 }
 
-// ===== 匯出 PDF =====
 async function exportPDF() {
   if (!highlights.length) {
     alert("尚未有任何標記");
