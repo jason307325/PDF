@@ -18,12 +18,10 @@
         .page-wrapper { position: relative; margin-bottom: 25px; background: white; border: 1px solid #000; box-shadow: 0 4px 8px rgba(0,0,0,0.3);}
         canvas { display: block; }
         
-        /* 網頁預覽的標記樣式 - 已移除底線 */
         .highlight-box { 
             position: absolute; 
             pointer-events: none;
-            mix-blend-mode: multiply; /* 讓文字透出來 */
-            transition: all 0.2s;
+            mix-blend-mode: multiply;
         }
 
         input, button { padding: 10px; border-radius: 4px; border: 1px solid #555; font-size: 14px; }
@@ -59,11 +57,11 @@
     let colorIndex = 0;
 
     const COLOR_PALETTE = [
-        { pdf: {r:0, g:0.7, b:1}, css: "rgba(0, 180, 255, 0.3)" },
-        { pdf: {r:1, g:0.3, b:0}, css: "rgba(255, 80, 0, 0.3)" },
-        { pdf: {r:0, g:0.7, b:0.3}, css: "rgba(0, 180, 80, 0.3)" },
-        { pdf: {r:0.7, g:0, b:1}, css: "rgba(180, 0, 255, 0.3)" },
-        { pdf: {r:0.9, g:0.8, b:0}, css: "rgba(230, 200, 0, 0.3)" }
+        { pdf: {r:0, g:0.7, b:1},   css: "rgba(0, 180, 255, 0.45)" },
+        { pdf: {r:1, g:0.3, b:0},   css: "rgba(255, 80, 0, 0.45)" },
+        { pdf: {r:0, g:0.7, b:0.3}, css: "rgba(0, 180, 80, 0.45)" },
+        { pdf: {r:0.7, g:0, b:1},   css: "rgba(180, 0, 255, 0.45)" },
+        { pdf: {r:0.9, g:0.8, b:0}, css: "rgba(230, 200, 0, 0.45)" }
     ];
 
     document.getElementById("fileInput").addEventListener("change", async (e) => {
@@ -105,7 +103,47 @@
         document.getElementById("pdf-container").appendChild(wrapper);
         await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
         const textContent = await page.getTextContent();
-        pagesRecords.push({ pageNum, viewport, textContent, overlay });
+
+        // 【修正】把同一行的相鄰 items 合併成完整文字行，方便跨 item 的關鍵字比對
+        const lines = buildLines(textContent.items, viewport);
+        pagesRecords.push({ pageNum, viewport, textContent, lines, overlay });
+    }
+
+    // 【新增】將 PDF.js 切碎的 text items 依 Y 軸位置合併成「行」
+    function buildLines(items, viewport) {
+        const lines = [];
+        // 先過濾掉無效 item
+        const validItems = items.filter(item => item.str && item.str.trim().length > 0 && item.width > 0);
+
+        // 依 Y 座標分組（PDF 座標系原點在左下，轉換到 viewport 後 y 往下增加）
+        validItems.forEach(item => {
+            const [tx, ty] = [item.transform[4], item.transform[5]];
+            // 轉換到 viewport 座標
+            const vpt = viewport.convertToViewportPoint(tx, ty);
+            const vx = vpt[0];
+            const vy = vpt[1];
+            // 字型高度：用 transform 中的縮放值估算，或 fallback 到 12px
+            const fontSize = Math.abs(item.transform[3]) || 12;
+            const vHeight = Math.max(fontSize * SCALE, 8);
+            const vWidth = item.width * SCALE;
+
+            // 找到同一行 (y 差距在 vHeight 的 60% 以內算同行)
+            let line = lines.find(l => Math.abs(l.baselineY - vy) < vHeight * 0.6);
+            if (!line) {
+                line = { baselineY: vy, segments: [] };
+                lines.push(line);
+            }
+            line.segments.push({ str: item.str, vx, vy, vWidth, vHeight, origItem: item });
+        });
+
+        // 每行依 x 排序
+        lines.forEach(line => {
+            line.segments.sort((a, b) => a.vx - b.vx);
+            // 合併成完整行文字（保留各 segment 邊界資訊）
+            line.fullText = line.segments.map(s => s.str).join("");
+        });
+
+        return lines;
     }
 
     function processSearch() {
@@ -120,35 +158,115 @@
         let foundCount = 0;
 
         pagesRecords.forEach(page => {
+            // 【修正】同時對原始 items 和合併後的 lines 做比對
+            // 策略1: 直接對每個 item 逐字比對（適用單詞關鍵字）
             page.textContent.items.forEach(item => {
+                if (!item.str || item.width <= 0) return;
                 const text = item.str.toLowerCase();
                 const isMatch = keywords.some(kw => text.includes(kw));
                 if (isMatch) {
-                    const [x1, y1, x2, y2] = page.viewport.convertToViewportRectangle([
-                        item.transform[4], item.transform[5],
-                        item.transform[4] + item.width, item.transform[5] + item.height
-                    ]);
-                    const box = document.createElement("div");
-                    box.className = "highlight-box";
-                    box.style.left = Math.min(x1, x2) + "px";
-                    box.style.top = Math.min(y1, y2) + "px";
-                    box.style.width = Math.abs(x2 - x1) + "px";
-                    box.style.height = Math.abs(y2 - y1) + "px";
-                    box.style.backgroundColor = currentColor.css;
-                    page.overlay.appendChild(box);
-
-                    allHighlights.push({
-                        pageIdx: page.pageNum - 1,
-                        x: item.transform[4], y: item.transform[5],
-                        w: item.width, h: item.height,
-                        colorPdf: currentColor.pdf
-                    });
+                    drawHighlightFromItem(item, page, currentColor);
                     foundCount++;
                 }
             });
+
+            // 策略2: 對合併行做比對，標記跨 item 的關鍵字（適用長關鍵字）
+            page.lines.forEach(line => {
+                const lineText = line.fullText.toLowerCase();
+                keywords.forEach(kw => {
+                    if (kw.length <= 1) return; // 單字元交給策略1處理，避免重複
+                    let idx = lineText.indexOf(kw);
+                    while (idx !== -1) {
+                        // 找出關鍵字對應的 segments 範圍
+                        const matchedSegs = findSegmentsForRange(line.segments, idx, idx + kw.length);
+                        if (matchedSegs.length > 0) {
+                            // 畫一個覆蓋所有 matched segments 的 highlight
+                            const minX = Math.min(...matchedSegs.map(s => s.vx));
+                            const maxX = Math.max(...matchedSegs.map(s => s.vx + s.vWidth));
+                            const minY = Math.min(...matchedSegs.map(s => s.vy - s.vHeight));
+                            const maxY = Math.max(...matchedSegs.map(s => s.vy));
+                            const boxW = maxX - minX;
+                            const boxH = maxY - minY;
+
+                            // 避免與策略1重複（只有跨多個 segment 時才畫）
+                            if (matchedSegs.length > 1) {
+                                const box = document.createElement("div");
+                                box.className = "highlight-box";
+                                box.style.left = minX + "px";
+                                box.style.top = minY + "px";
+                                box.style.width = boxW + "px";
+                                box.style.height = Math.max(boxH, 8) + "px";
+                                box.style.backgroundColor = currentColor.css;
+                                page.overlay.appendChild(box);
+
+                                // 記錄到 allHighlights（用原始 PDF 座標）
+                                const firstSeg = matchedSegs[0].origItem;
+                                const lastSeg = matchedSegs[matchedSegs.length - 1].origItem;
+                                allHighlights.push({
+                                    pageIdx: page.pageNum - 1,
+                                    x: firstSeg.transform[4],
+                                    y: firstSeg.transform[5],
+                                    w: lastSeg.transform[4] + lastSeg.width - firstSeg.transform[4],
+                                    h: Math.abs(firstSeg.transform[3]) || 12,
+                                    colorPdf: currentColor.pdf
+                                });
+                                foundCount++;
+                            }
+                        }
+                        idx = lineText.indexOf(kw, idx + 1);
+                    }
+                });
+            });
         });
+
         updateStatus(`本次新增 ${foundCount} 筆標記，總計 ${allHighlights.length} 筆`, false);
         document.getElementById("keywordInput").value = "";
+    }
+
+    // 【新增】從單一 item 繪製 highlight（修正座標轉換）
+    function drawHighlightFromItem(item, page, currentColor) {
+        const viewport = page.viewport;
+        const tx = item.transform[4];
+        const ty = item.transform[5];
+        // 【修正】使用 convertToViewportPoint 而非 convertToViewportRectangle
+        const [vx, vy] = viewport.convertToViewportPoint(tx, ty);
+        const vWidth = item.width * SCALE;
+        const fontSize = Math.abs(item.transform[3]) || 12;
+        const vHeight = Math.max(fontSize * SCALE, 8);
+
+        const box = document.createElement("div");
+        box.className = "highlight-box";
+        box.style.left = vx + "px";
+        box.style.top = (vy - vHeight) + "px";   // vy 是 baseline，往上偏移字高
+        box.style.width = vWidth + "px";
+        box.style.height = vHeight + "px";
+        box.style.backgroundColor = currentColor.css;
+        page.overlay.appendChild(box);
+
+        allHighlights.push({
+            pageIdx: page.pageNum - 1,
+            x: tx, y: ty,
+            w: item.width,
+            h: fontSize,
+            colorPdf: currentColor.pdf
+        });
+    }
+
+    // 【新增】找出 fullText[start..end] 對應到哪些 segments
+    function findSegmentsForRange(segments, start, end) {
+        const result = [];
+        let cursor = 0;
+        for (const seg of segments) {
+            const segStart = cursor;
+            const segEnd = cursor + seg.str.length;
+            // 有交集就納入
+            if (segEnd > start && segStart < end) {
+                result.push(seg);
+            }
+            cursor = segEnd;
+            if (cursor >= end) break;
+        }
+        return result;
     }
 
     async function exportPDF() {
@@ -164,16 +282,12 @@
                 if (h.pageIdx >= pages.length) return;
                 const p = pages[h.pageIdx];
                 const colorObj = h.colorPdf;
-                
-                // 僅繪製半透明螢光色塊
                 p.drawRectangle({
                     x: h.x, y: h.y, width: h.w, height: h.h,
                     color: rgb(colorObj.r, colorObj.g, colorObj.b), 
                     opacity: 0.35,
                     blendMode: BlendMode.Multiply
                 });
-
-                // 原本的 p.drawLine (底線功能) 已在此移除
             });
 
             const pdfBytes = await pdfDocLib.save();
@@ -181,7 +295,7 @@
             updateStatus("匯出成功！", false);
         } catch (err) {
             console.error(err);
-            updateStatus("匯出失敗", true);
+            updateStatus("匯出失敗：" + err.message, true);
         }
     }
 
