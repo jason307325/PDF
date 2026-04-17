@@ -161,29 +161,77 @@
         return lines;
     }
 
-    // 找出某 segment 所屬的 line,並回傳「左邊前一格」segment
-    // (排版固定為:姓名 / 單位 / 秒數,搜尋單位時要連同前方姓名一起標記)
+    // 計算該行的「小間距」閾值,用於自適應不同排版的 PDF
+    // 有些 PDF 每個中文字都是獨立 text item (間距≈0),有些 PDF 整個詞是一個 item
+    // 取本行最大間距的 40% 與字高 2 倍的較大者作為閾值
+    function getSmallGapThreshold(line) {
+        if (line.segments.length < 2) return Infinity;
+        let maxGap = 0;
+        for (let i = 1; i < line.segments.length; i++) {
+            const s1 = line.segments[i - 1], s2 = line.segments[i];
+            const gap = s2.vx - (s1.vx + s1.vWidth);
+            if (gap > maxGap) maxGap = gap;
+        }
+        const avgHeight = line.segments[0].vHeight || 12;
+        return Math.max(maxGap * 0.4, avgHeight * 2);
+    }
+
+    // 判斷某個 segment 是否為「區塊分隔符」(底線、時間括號等)
+    // 遇到這類符號時,不應跨越它去納入其他 segment,避免誤標前一筆資料
+    function isBlockSeparator(seg) {
+        const s = seg.str.trim();
+        if (/^_+$/.test(s)) return true;             // 全底線 ___
+        if (/^\(\d+[:.]\d+/.test(s)) return true;    // 時間括號 (05:45.00)
+        return false;
+    }
+
+    // 找出某命中 segment 往左該「連動標記」的其他 segments
+    // 採用兩步法,同時適應兩種排版:
+    // 1) 姓名/單位/秒數是獨立 text item (青年盃型)
+    // 2) 每個中文字是獨立 text item (全小運型,姓名+單位合併成 "許采婕(台北YMCA)")
     function findNeighborSegments(line, targetSeg) {
         const idx = line.segments.indexOf(targetSeg);
-        if (idx === -1) return [];
-        const neighbors = [];
-        const avgHeight = targetSeg.vHeight;
+        if (idx <= 0) return [];
+        const smallGap = getSmallGapThreshold(line);
+        const result = [];
 
-        // 判斷「相鄰」的條件:水平間距不能太遠 (超過 15 倍字高視為不同資料區塊)
-        const MAX_GAP = avgHeight * 15;
-
-        // 只往左找前一個有意義的 segment (姓名欄)
+        // Step 1: 往左連續納入「小間距」的 segments (視為同一欄位內部)
+        // 遇到區塊分隔符 (底線、時間括號) 或大間距時停止
+        let current = targetSeg;
+        let stopIdx = -1;
         for (let i = idx - 1; i >= 0; i--) {
             const prev = line.segments[i];
-            const gap = targetSeg.vx - (prev.vx + prev.vWidth);
-            if (gap > MAX_GAP) break;
-            if (prev.str.trim().length > 0) {
-                neighbors.push(prev);
-                break; // 只要最靠近的前一格
+            if (isBlockSeparator(prev)) { stopIdx = i - 1; break; }
+            const gap = current.vx - (prev.vx + prev.vWidth);
+            if (gap > smallGap) { stopIdx = i; break; }
+            result.unshift(prev);
+            current = prev;
+        }
+
+        // Step 2: 越過大間距,再納入「前一個欄位」(例如獨立成欄的姓名)
+        // 同樣只用小間距往左擴展,遇到分隔符就停
+        if (stopIdx >= 0) {
+            for (let i = stopIdx; i >= 0; i--) {
+                const prev = line.segments[i];
+                if (isBlockSeparator(prev)) break;
+                if (prev.str.trim().length === 0) continue;
+
+                const extraGroup = [prev];
+                let cursor = prev;
+                for (let j = i - 1; j >= 0; j--) {
+                    const p2 = line.segments[j];
+                    if (isBlockSeparator(p2)) break;
+                    const g = cursor.vx - (p2.vx + p2.vWidth);
+                    if (g > smallGap) break;
+                    extraGroup.unshift(p2);
+                    cursor = p2;
+                }
+                result.unshift(...extraGroup);
+                break;
             }
         }
 
-        return neighbors;
+        return result;
     }
 
     // 【新增】為一個 segment 畫上 highlight (螢光筆 + 可選的黑框/底線)
