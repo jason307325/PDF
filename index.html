@@ -51,7 +51,7 @@
     <button class="btn-add" onclick="processSearch()">新增多色標記</button>
     <div class="opt-group">
         <input type="checkbox" id="optNeighbor" checked>
-        <label for="optNeighbor">連動標記同行姓名欄</label>
+        <label for="optNeighbor">連動標記前方姓名欄</label>
     </div>
     <div class="opt-group">
         <input type="checkbox" id="optPrintFriendly" checked>
@@ -161,7 +161,8 @@
         return lines;
     }
 
-    // 【新增】找出某 segment 所屬的 line,並回傳相鄰的 segments (前一格 + 後一格)
+    // 找出某 segment 所屬的 line,並回傳「左邊前一格」segment
+    // (排版固定為:姓名 / 單位 / 秒數,搜尋單位時要連同前方姓名一起標記)
     function findNeighborSegments(line, targetSeg) {
         const idx = line.segments.indexOf(targetSeg);
         if (idx === -1) return [];
@@ -171,7 +172,7 @@
         // 判斷「相鄰」的條件:水平間距不能太遠 (超過 15 倍字高視為不同資料區塊)
         const MAX_GAP = avgHeight * 15;
 
-        // 往左找前一個有意義的 segment
+        // 只往左找前一個有意義的 segment (姓名欄)
         for (let i = idx - 1; i >= 0; i--) {
             const prev = line.segments[i];
             const gap = targetSeg.vx - (prev.vx + prev.vWidth);
@@ -179,17 +180,6 @@
             if (prev.str.trim().length > 0) {
                 neighbors.push(prev);
                 break; // 只要最靠近的前一格
-            }
-        }
-
-        // 往右找後一個有意義的 segment
-        for (let i = idx + 1; i < line.segments.length; i++) {
-            const next = line.segments[i];
-            const gap = next.vx - (targetSeg.vx + targetSeg.vWidth);
-            if (gap > MAX_GAP) break;
-            if (next.str.trim().length > 0) {
-                neighbors.push(next);
-                break; // 只要最靠近的後一格
             }
         }
 
