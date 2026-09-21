@@ -8,18 +8,18 @@
     <script src="https://unpkg.com/pdf-lib/dist/pdf-lib.min.js"></script>
     <style>
         body { font-family: "Microsoft JhengHei", sans-serif; margin: 0; background: #323639; color: white; }
-        #controls { 
-            position: sticky; top: 0; z-index: 1000; 
-            background: #202124; padding: 15px; 
+        #controls {
+            position: sticky; top: 0; z-index: 1000;
+            background: #202124; padding: 15px;
             display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
             box-shadow: 0 2px 10px rgba(0,0,0,0.5);
         }
         #pdf-container { display: flex; flex-direction: column; align-items: center; padding: 20px; background: #525659;}
         .page-wrapper { position: relative; margin-bottom: 25px; background: white; border: 1px solid #000; box-shadow: 0 4px 8px rgba(0,0,0,0.3);}
         canvas { display: block; }
-        
-        .highlight-box { 
-            position: absolute; 
+
+        .highlight-box {
+            position: absolute;
             pointer-events: none;
             mix-blend-mode: multiply;
         }
@@ -37,17 +37,39 @@
         .btn-add:hover { background: #2980b9; }
         .btn-export { background: #27ae60; color: white; border: none; font-weight: bold; cursor: pointer; transition: background 0.2s;}
         .btn-export:hover { background: #219a52; }
-        #status { font-size: 13px; color: #bbb; margin-left: auto; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 300px;}
+        .btn-clear { background: #3a3d41; color: #ddd; border: 1px solid #555; cursor: pointer; transition: background 0.2s;}
+        .btn-clear:hover { background: #c0392b; color: #fff; border-color: #c0392b; }
+        #status { font-size: 13px; color: #bbb; margin-left: auto; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 340px;}
         .opt-group { display: flex; align-items: center; gap: 6px; background: #2c2f33; padding: 6px 10px; border-radius: 4px; border: 1px solid #444;}
         .opt-group label { border: none; padding: 0; font-size: 13px; color: #ddd; cursor: pointer;}
         .opt-group input[type="checkbox"] { cursor: pointer; }
+
+        /* 已標記的關鍵字清單:一次搜尋一個標籤,按 ✕ 可單獨移除 */
+        #legend {
+            width: 100%; display: none; flex-wrap: wrap; gap: 8px; align-items: center;
+            padding-top: 10px; border-top: 1px solid #3a3d41;
+        }
+        #legend.show { display: flex; }
+        #legend .lbl { font-size: 12px; color: #999; margin-right: 4px; }
+        .chip {
+            display: inline-flex; align-items: center; gap: 8px;
+            background: #2c2f33; border: 1px solid #444; border-radius: 999px;
+            padding: 4px 6px 4px 10px; font-size: 13px; color: #eee;
+        }
+        .chip i { width: 12px; height: 12px; border-radius: 50%; display: inline-block; border: 1px solid rgba(255,255,255,.25); }
+        .chip small { color: #999; }
+        .chip button {
+            border: none; background: transparent; color: #999; padding: 0 4px; font-size: 14px;
+            line-height: 1; cursor: pointer; border-radius: 50%;
+        }
+        .chip button:hover { color: #fff; background: #c0392b; }
     </style>
 </head>
 <body>
 
 <div id="controls">
     <input type="file" id="fileInput" accept="application/pdf">
-    <input type="text" id="keywordInput" placeholder="輸入關鍵字 (例如:合約,日期)">
+    <input type="text" id="keywordInput" placeholder="輸入關鍵字 (例如:台北YMCA,高雄)">
     <button class="btn-add" onclick="processSearch()">新增多色標記</button>
     <div class="opt-group">
         <input type="checkbox" id="optNeighbor" checked>
@@ -57,8 +79,10 @@
         <input type="checkbox" id="optPrintFriendly" checked>
         <label for="optPrintFriendly">列印友善(加底線)</label>
     </div>
+    <button class="btn-clear" onclick="clearAll()">清除全部標記</button>
     <button class="btn-export" onclick="exportPDF()">匯出最終 PDF</button>
     <span id="status">等待檔案載入...</span>
+    <div id="legend"><span class="lbl">已標記:</span></div>
 </div>
 
 <div id="pdf-container"></div>
@@ -67,19 +91,22 @@
     const pdfjsLib = window['pdfjs-dist/build/pdf'];
     pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
 
-    const SCALE = 1.5; 
+    const SCALE = 1.5;
     let originalPdfBytes = null;
+    let originalFileName = "";
     let pdfDoc = null;
     let pagesRecords = [];
-    let allHighlights = [];
+    let batches = [];                 // 每按一次「新增多色標記」就是一個 batch,可以單獨移除
+    let highlightedSegs = new Map();  // segment -> batch,避免同一段文字被重複疊色
+    let batchSeq = 0;
     let colorIndex = 0;
 
     const COLOR_PALETTE = [
-        { pdf: {r:0, g:0.7, b:1},   css: "rgba(0, 180, 255, 0.45)" },
-        { pdf: {r:1, g:0.3, b:0},   css: "rgba(255, 80, 0, 0.45)" },
-        { pdf: {r:0, g:0.7, b:0.3}, css: "rgba(0, 180, 80, 0.45)" },
-        { pdf: {r:0.7, g:0, b:1},   css: "rgba(180, 0, 255, 0.45)" },
-        { pdf: {r:0.9, g:0.8, b:0}, css: "rgba(230, 200, 0, 0.45)" }
+        { pdf: {r:0, g:0.7, b:1},   css: "rgba(0, 180, 255, 0.45)",  dot: "rgb(0,180,255)" },
+        { pdf: {r:1, g:0.3, b:0},   css: "rgba(255, 80, 0, 0.45)",   dot: "rgb(255,80,0)" },
+        { pdf: {r:0, g:0.7, b:0.3}, css: "rgba(0, 180, 80, 0.45)",   dot: "rgb(0,180,80)" },
+        { pdf: {r:0.7, g:0, b:1},   css: "rgba(180, 0, 255, 0.45)",  dot: "rgb(180,0,255)" },
+        { pdf: {r:0.9, g:0.8, b:0}, css: "rgba(230, 200, 0, 0.45)",  dot: "rgb(230,200,0)" }
     ];
 
     document.getElementById("fileInput").addEventListener("change", async (e) => {
@@ -88,12 +115,15 @@
         updateStatus("讀取並渲染 PDF 中...", false);
         try {
             originalPdfBytes = await file.arrayBuffer();
+            originalFileName = file.name.replace(/\.pdf$/i, "");
             const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(originalPdfBytes.slice(0)) });
             pdfDoc = await loadingTask.promise;
             document.getElementById("pdf-container").innerHTML = "";
             pagesRecords = [];
-            allHighlights = [];
+            batches = [];
+            highlightedSegs = new Map();
             colorIndex = 0;
+            renderLegend();
             for (let i = 1; i <= pdfDoc.numPages; i++) {
                 await renderPage(i);
             }
@@ -102,6 +132,11 @@
             console.error(err);
             updateStatus("載入失敗,請確認檔案是否受保護。", true);
         }
+    });
+
+    // 在關鍵字欄按 Enter 等於按「新增多色標記」
+    document.getElementById("keywordInput").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") { e.preventDefault(); processSearch(); }
     });
 
     async function renderPage(pageNum) {
@@ -146,203 +181,99 @@
                 line = { baselineY: vy, segments: [] };
                 lines.push(line);
             }
-            line.segments.push({ 
-                str: item.str, vx, vy, vWidth, vHeight, 
-                origItem: item,
-                matched: false  // 標記此 segment 是否已被命中
+            line.segments.push({
+                str: item.str, vx, vy, vWidth, vHeight,
+                origItem: item
             });
         });
 
         lines.forEach(line => {
             line.segments.sort((a, b) => a.vx - b.vx);
             line.fullText = line.segments.map(s => s.str).join("");
+            line.tokens = buildTokens(line.segments);
         });
 
         return lines;
     }
 
-    // 計算該行的「小間距」閾值,用於自適應不同排版的 PDF
-    // 有些 PDF 每個中文字都是獨立 text item (間距≈0),有些 PDF 整個詞是一個 item
-    // 取本行最大間距的 40% 與字高 2 倍的較大者作為閾值
-    function getSmallGapThreshold(line) {
-        if (line.segments.length < 2) return Infinity;
-        let maxGap = 0;
-        for (let i = 1; i < line.segments.length; i++) {
-            const s1 = line.segments[i - 1], s2 = line.segments[i];
-            const gap = s2.vx - (s1.vx + s1.vWidth);
-            if (gap > maxGap) maxGap = gap;
-        }
-        const avgHeight = line.segments[0].vHeight || 12;
-        return Math.max(maxGap * 0.4, avgHeight * 2);
+    /* ==================== core:start ====================
+     * 「連動標記前方姓名欄」的核心邏輯。
+     *
+     * 秩序冊一行可能長這樣(左右兩組並排):
+     *   1 王小明(台北YMCA) (01:02.35)      5 李小華(高雄泳訓) (01:03.00)
+     * 搜「高雄泳訓」時,只能往左納入「李小華」和水道「5」,
+     * 不可以越過 (01:02.35) 跑去標前一組的王小明。
+     *
+     * 做法:先把碎片依「幾乎沒有間距」黏成 token(一個詞),再依 token 的長相判斷邊界:
+     *   - 成績/時間 (01:02.35)、底線 ____  → 是前一筆的結尾,停下、不納入
+     *   - 水道號 1~99                       → 是這一筆的開頭,納入後停下
+     *   - 隔著大空隙的「姓名(單位)」        → 是另一筆,停下
+     */
+    const RE_TIME      = /^[\(（]?\s*(?:(?:\d{1,2}[:'′])?\d{1,2}[.:"″]\d{1,2}|NT|--+|—+)\s*[\)）]?$/i;
+    const RE_TIME_TAIL = /(?:\d{1,2}[:'′])?\d{1,2}[.:"″]\d{2}\s*[\)）]?$/;   // 「姓名(單位)(01:02.35)」黏成一個 token 的情況
+    const RE_LANE      = /^\d{1,2}$/;
+    const RE_UNDERLINE = /^_{2,}$/;
+    const RE_ENTRY     = /^[^()（）]+[\(（][^()（）]+[\)）]/;                 // 姓名(單位)
+
+    function classifyToken(text) {
+        if (!text) return "empty";
+        if (RE_UNDERLINE.test(text)) return "underline";
+        if (RE_TIME.test(text)) return "time";
+        if (RE_LANE.test(text)) return "lane";
+        return "text";
     }
 
-    // 判斷某個 segment 是否為「區塊分隔符」(底線、時間括號等)
-    // 遇到這類符號時,不應跨越它去納入其他 segment,避免誤標前一筆資料
-    function isBlockSeparator(seg) {
-        const s = seg.str.trim();
-        if (/^_+$/.test(s)) return true;             // 全底線 ___
-        if (/^\(\d+[:.]\d+/.test(s)) return true;    // 時間括號 (05:45.00)
-        return false;
-    }
-
-    // 找出某命中 segment 往左該「連動標記」的其他 segments
-    // 採用兩步法,同時適應兩種排版:
-    // 1) 姓名/單位/秒數是獨立 text item (青年盃型)
-    // 2) 每個中文字是獨立 text item (全小運型,姓名+單位合併成 "許采婕(台北YMCA)")
-    function findNeighborSegments(line, targetSeg) {
-        const idx = line.segments.indexOf(targetSeg);
-        if (idx <= 0) return [];
-        const smallGap = getSmallGapThreshold(line);
-        const result = [];
-
-        // Step 1: 往左連續納入「小間距」的 segments (視為同一欄位內部)
-        // 遇到區塊分隔符 (底線、時間括號) 或大間距時停止
-        let current = targetSeg;
-        let stopIdx = -1;
-        for (let i = idx - 1; i >= 0; i--) {
-            const prev = line.segments[i];
-            if (isBlockSeparator(prev)) { stopIdx = i - 1; break; }
-            const gap = current.vx - (prev.vx + prev.vWidth);
-            if (gap > smallGap) { stopIdx = i; break; }
-            result.unshift(prev);
-            current = prev;
-        }
-
-        // Step 2: 越過大間距,再納入「前一個欄位」(例如獨立成欄的姓名)
-        // 同樣只用小間距往左擴展,遇到分隔符就停
-        if (stopIdx >= 0) {
-            for (let i = stopIdx; i >= 0; i--) {
-                const prev = line.segments[i];
-                if (isBlockSeparator(prev)) break;
-                if (prev.str.trim().length === 0) continue;
-
-                const extraGroup = [prev];
-                let cursor = prev;
-                for (let j = i - 1; j >= 0; j--) {
-                    const p2 = line.segments[j];
-                    if (isBlockSeparator(p2)) break;
-                    const g = cursor.vx - (p2.vx + p2.vWidth);
-                    if (g > smallGap) break;
-                    extraGroup.unshift(p2);
-                    cursor = p2;
-                }
-                result.unshift(...extraGroup);
-                break;
+    // 把同一行的 segments 依「幾乎沒有間距」黏成 token
+    // (有些 PDF 每個中文字都是獨立 item,黏起來才看得出「李小華(高雄泳訓)」是一個詞)
+    function buildTokens(segments) {
+        const tokens = [];
+        let cur = null;
+        for (const seg of segments) {
+            const glue = Math.max(1, seg.vHeight * 0.2);   // 小於 0.2 個字高視為同一個詞;半形空格約 0.25~0.33 字高
+            if (cur && seg.vx - cur.right <= glue) {
+                cur.segs.push(seg);
+                cur.right = Math.max(cur.right, seg.vx + seg.vWidth);
+                cur.raw += seg.str;
+            } else {
+                cur = { segs: [seg], left: seg.vx, right: seg.vx + seg.vWidth, raw: seg.str, height: seg.vHeight };
+                tokens.push(cur);
             }
         }
+        tokens.forEach((t, i) => {
+            t.index = i;
+            t.text = t.raw.replace(/\s+/g, " ").trim();
+            t.kind = classifyToken(t.text);
+            t.segs.forEach(s => { s.token = t; });
+        });
+        return tokens;
+    }
 
+    // 從命中的 token 往左找該一起標記的 token(姓名、水道號),最多往左納入 4 個詞
+    function findNeighborTokens(tokens, idx) {
+        const result = [];
+        if (idx <= 0) return result;
+        const height = tokens[idx].height || 12;
+
+        // 找出本行「明顯比其他空隙都寬」的欄間空隙(左右兩組並排時中間那一段):
+        // 要比字高的 6 倍寬,而且比第二寬的空隙寬一倍以上,才算。這種空隙絕對不跨。
+        const gaps = [];
+        for (let i = 1; i < tokens.length; i++) gaps.push(tokens[i].left - tokens[i - 1].right);
+        const sorted = [...gaps].sort((a, b) => b - a);
+        const divider = (sorted.length >= 2 && sorted[0] > height * 6 && sorted[0] > sorted[1] * 2) ? sorted[0] : Infinity;
+
+        let cur = tokens[idx];
+        for (let i = idx - 1; i >= 0 && result.length < 4; i--) {
+            const t = tokens[i];
+            if (t.kind === "time" || t.kind === "underline") break;   // 前一筆的結尾
+            if (RE_TIME_TAIL.test(t.text)) break;                     // 「姓名(單位)(成績)」整個黏在一起,也是前一筆
+            const gap = cur.left - t.right;
+            if (gap >= divider) break;                                // 欄間大空隙
+            if (gap > height * 2 && RE_ENTRY.test(t.text)) break;    // 隔著空隙的「姓名(單位)」是另一筆
+            result.unshift(t);
+            cur = t;
+            if (t.kind === "lane") break;                             // 水道號是一筆的開頭
+        }
         return result;
-    }
-
-    // 【新增】為一個 segment 畫上 highlight (螢光筆 + 可選的黑框/底線)
-    function drawHighlightForSegment(seg, page, currentColor, printFriendly) {
-        const item = seg.origItem;
-        const vx = seg.vx;
-        const vy = seg.vy;
-        const vWidth = seg.vWidth;
-        const vHeight = seg.vHeight;
-
-        // 螢光筆本體
-        const box = document.createElement("div");
-        box.className = "highlight-box";
-        box.style.left = vx + "px";
-        box.style.top = (vy - vHeight) + "px";
-        box.style.width = vWidth + "px";
-        box.style.height = vHeight + "px";
-        box.style.backgroundColor = currentColor.css;
-        page.overlay.appendChild(box);
-
-        // 列印友善:在文字下方加底線 (不壓到文字本身)
-        if (printFriendly) {
-            const underline = document.createElement("div");
-            underline.className = "highlight-underline";
-            underline.style.left = vx + "px";
-            // vy 是 baseline,文字在 baseline 上方,所以底線畫在 vy + 小間距 處
-            underline.style.top = (vy + 1) + "px";
-            underline.style.width = vWidth + "px";
-            page.overlay.appendChild(underline);
-        }
-
-        // 記錄到 allHighlights (PDF 原始座標)
-        allHighlights.push({
-            pageIdx: page.pageNum - 1,
-            x: item.transform[4],
-            y: item.transform[5],
-            w: item.width,
-            h: Math.abs(item.transform[3]) || 12,
-            colorPdf: currentColor.pdf,
-            printFriendly: printFriendly
-        });
-    }
-
-    function processSearch() {
-        const inputStr = document.getElementById("keywordInput").value.trim();
-        if (!inputStr || !pdfDoc) {
-            alert("請先輸入關鍵字並載入 PDF");
-            return;
-        }
-        const includeNeighbor = document.getElementById("optNeighbor").checked;
-        const printFriendly = document.getElementById("optPrintFriendly").checked;
-
-        const keywords = inputStr.split(",").map(k => k.trim().toLowerCase()).filter(k => k);
-        const currentColor = COLOR_PALETTE[colorIndex % COLOR_PALETTE.length];
-        colorIndex++;
-        let foundCount = 0;
-
-        pagesRecords.forEach(page => {
-            // 重置本次搜尋的 matched 狀態 (跨搜尋不累計,避免顏色混亂)
-            page.lines.forEach(line => {
-                line.segments.forEach(seg => { seg._currentMatched = false; });
-            });
-
-            // 策略1: 對每個 segment 比對關鍵字
-            page.lines.forEach(line => {
-                line.segments.forEach(seg => {
-                    const text = seg.str.toLowerCase();
-                    if (keywords.some(kw => text.includes(kw))) {
-                        seg._currentMatched = true;
-                    }
-                });
-            });
-
-            // 策略2: 對合併行做比對,標記跨 segment 的關鍵字
-            page.lines.forEach(line => {
-                const lineText = line.fullText.toLowerCase();
-                keywords.forEach(kw => {
-                    if (kw.length <= 1) return;
-                    let idx = lineText.indexOf(kw);
-                    while (idx !== -1) {
-                        const matchedSegs = findSegmentsForRange(line.segments, idx, idx + kw.length);
-                        matchedSegs.forEach(s => { s._currentMatched = true; });
-                        idx = lineText.indexOf(kw, idx + 1);
-                    }
-                });
-            });
-
-            // 【關鍵修改】收集所有要繪製的 segments (含相鄰欄位)
-            const segmentsToDraw = new Set();
-            page.lines.forEach(line => {
-                line.segments.forEach(seg => {
-                    if (seg._currentMatched) {
-                        segmentsToDraw.add(seg);
-                        // 連動標記前後相鄰的 segment
-                        if (includeNeighbor) {
-                            const neighbors = findNeighborSegments(line, seg);
-                            neighbors.forEach(n => segmentsToDraw.add(n));
-                        }
-                    }
-                });
-            });
-
-            // 統一繪製 (使用 Set 避免重複畫同一個 segment)
-            segmentsToDraw.forEach(seg => {
-                drawHighlightForSegment(seg, page, currentColor, printFriendly);
-                foundCount++;
-            });
-        });
-
-        updateStatus(`本次新增 ${foundCount} 筆標記,總計 ${allHighlights.length} 筆`, false);
-        document.getElementById("keywordInput").value = "";
     }
 
     function findSegmentsForRange(segments, start, end) {
@@ -360,8 +291,181 @@
         return result;
     }
 
+    // 關鍵字:半形逗號、全形逗號、頓號、分號、換行都能分隔
+    function splitKeywords(inputStr) {
+        return [...new Set(inputStr.split(/[,，、;；\n]+/).map(k => k.trim()).filter(k => k))];
+    }
+
+    // 找出一行裡所有命中的 segment
+    function matchLine(line, keywordsRaw) {
+        const matched = new Set();
+        const keywords = keywordsRaw.map(k => k.toLowerCase());   // 比對不分大小寫
+        // 策略1: 對每個 segment 比對關鍵字
+        line.segments.forEach(seg => {
+            const text = seg.str.toLowerCase();
+            if (keywords.some(kw => text.includes(kw))) matched.add(seg);
+        });
+        // 策略2: 對合併行做比對,標記跨 segment 的關鍵字
+        const lineText = line.fullText.toLowerCase();
+        keywords.forEach(kw => {
+            if (kw.length <= 1) return;
+            let idx = lineText.indexOf(kw);
+            while (idx !== -1) {
+                findSegmentsForRange(line.segments, idx, idx + kw.length).forEach(s => matched.add(s));
+                idx = lineText.indexOf(kw, idx + 1);
+            }
+        });
+        return matched;
+    }
+
+    // 回傳這一行該畫的 segments,以及命中了幾個 token(幾筆)
+    function collectLine(line, keywords, includeNeighbor) {
+        const matched = matchLine(line, keywords);
+        const toDraw = new Set(matched);
+        const hitTokens = new Set([...matched].map(s => s.token));
+        if (includeNeighbor) {
+            hitTokens.forEach(tok => {
+                tok.segs.forEach(s => toDraw.add(s));                      // 命中的那個詞整個標(例如 李小華(高雄泳訓))
+                findNeighborTokens(line.tokens, tok.index).forEach(n => n.segs.forEach(s => toDraw.add(s)));
+            });
+        }
+        return { toDraw, hits: hitTokens.size };
+    }
+    /* ==================== core:end ==================== */
+
+    // 為一個 segment 畫上 highlight (螢光筆 + 可選的底線)
+    function drawHighlightForSegment(seg, page, batch) {
+        const item = seg.origItem;
+        const { vx, vy, vWidth, vHeight } = seg;
+
+        // 螢光筆本體
+        const box = document.createElement("div");
+        box.className = "highlight-box";
+        box.style.left = vx + "px";
+        box.style.top = (vy - vHeight) + "px";
+        box.style.width = vWidth + "px";
+        box.style.height = vHeight + "px";
+        box.style.backgroundColor = batch.color.css;
+        page.overlay.appendChild(box);
+        batch.nodes.push(box);
+
+        // 列印友善:在文字下方加底線 (不壓到文字本身)
+        if (batch.printFriendly) {
+            const underline = document.createElement("div");
+            underline.className = "highlight-underline";
+            underline.style.left = vx + "px";
+            underline.style.top = (vy + 1) + "px";
+            underline.style.width = vWidth + "px";
+            page.overlay.appendChild(underline);
+            batch.nodes.push(underline);
+        }
+
+        // 記錄 PDF 原始座標,匯出時用
+        batch.rects.push({
+            pageIdx: page.pageNum - 1,
+            x: item.transform[4],
+            y: item.transform[5],
+            w: item.width,
+            h: Math.abs(item.transform[3]) || 12
+        });
+        batch.segs.push(seg);
+        highlightedSegs.set(seg, batch);
+    }
+
+    function processSearch() {
+        const inputStr = document.getElementById("keywordInput").value.trim();
+        if (!inputStr || !pdfDoc) {
+            alert("請先輸入關鍵字並載入 PDF");
+            return;
+        }
+        const includeNeighbor = document.getElementById("optNeighbor").checked;
+        const printFriendly = document.getElementById("optPrintFriendly").checked;
+        const keywords = splitKeywords(inputStr);
+        if (!keywords.length) return;
+
+        const batch = {
+            id: ++batchSeq,
+            label: keywords.join("、"),
+            color: COLOR_PALETTE[colorIndex % COLOR_PALETTE.length],
+            printFriendly,
+            nodes: [], rects: [], segs: [], hits: 0
+        };
+        let skipped = 0;
+
+        pagesRecords.forEach(page => {
+            page.lines.forEach(line => {
+                const { toDraw, hits } = collectLine(line, keywords, includeNeighbor);
+                batch.hits += hits;
+                toDraw.forEach(seg => {
+                    if (highlightedSegs.has(seg)) { skipped++; return; }   // 已經標過就不重疊
+                    drawHighlightForSegment(seg, page, batch);
+                });
+            });
+        });
+
+        if (batch.hits === 0) {
+            updateStatus(`找不到「${batch.label}」`, true);
+            return;
+        }
+        if (batch.segs.length === 0) {
+            updateStatus(`「${batch.label}」共 ${batch.hits} 處,之前都已經標記過了`, true);
+            return;
+        }
+        colorIndex++;
+        batches.push(batch);
+        renderLegend();
+        const note = skipped ? `(${skipped} 段已標記過,略過)` : "";
+        updateStatus(`「${batch.label}」命中 ${batch.hits} 處 ${note},目前共 ${batches.length} 組標記`, false);
+        document.getElementById("keywordInput").value = "";
+        document.getElementById("keywordInput").focus();
+    }
+
+    function removeBatch(id) {
+        const idx = batches.findIndex(b => b.id === id);
+        if (idx === -1) return;
+        const batch = batches[idx];
+        batch.nodes.forEach(n => n.remove());
+        batch.segs.forEach(s => { if (highlightedSegs.get(s) === batch) highlightedSegs.delete(s); });
+        batches.splice(idx, 1);
+        renderLegend();
+        updateStatus(`已移除「${batch.label}」的標記,目前共 ${batches.length} 組`, false);
+    }
+
+    function clearAll() {
+        if (!batches.length) return;
+        if (!confirm(`要清除全部 ${batches.length} 組標記嗎?`)) return;
+        batches.forEach(b => b.nodes.forEach(n => n.remove()));
+        batches = [];
+        highlightedSegs = new Map();
+        colorIndex = 0;
+        renderLegend();
+        updateStatus("已清除全部標記", false);
+    }
+
+    function renderLegend() {
+        const legend = document.getElementById("legend");
+        legend.querySelectorAll(".chip").forEach(c => c.remove());
+        legend.classList.toggle("show", batches.length > 0);
+        batches.forEach(b => {
+            const chip = document.createElement("span");
+            chip.className = "chip";
+            const dot = document.createElement("i");
+            dot.style.background = b.color.dot;
+            const text = document.createElement("span");
+            text.textContent = b.label + " ";
+            const small = document.createElement("small");
+            small.textContent = `${b.hits} 處`;
+            const btn = document.createElement("button");
+            btn.textContent = "✕";
+            btn.title = "移除這組標記";
+            btn.onclick = () => removeBatch(b.id);
+            chip.append(dot, text, small, btn);
+            legend.appendChild(chip);
+        });
+    }
+
     async function exportPDF() {
-        if (!allHighlights.length) return alert("尚未標記任何關鍵字");
+        if (!batches.length) return alert("尚未標記任何關鍵字");
         updateStatus("正在產生最終 PDF...", false);
         try {
             if (typeof window.PDFLib === 'undefined') throw new Error("PDF 處理核心尚未載入完成。");
@@ -369,36 +473,37 @@
             const pdfDocLib = await PDFDocument.load(new Uint8Array(originalPdfBytes.slice(0)));
             const pages = pdfDocLib.getPages();
 
-            allHighlights.forEach(h => {
-                if (h.pageIdx >= pages.length) return;
-                const p = pages[h.pageIdx];
-                const colorObj = h.colorPdf;
+            batches.forEach(batch => {
+                const c = batch.color.pdf;
+                batch.rects.forEach(h => {
+                    if (h.pageIdx >= pages.length) return;
+                    const p = pages[h.pageIdx];
 
-                // 1. 螢光筆色塊
-                p.drawRectangle({
-                    x: h.x, y: h.y, width: h.w, height: h.h,
-                    color: rgb(colorObj.r, colorObj.g, colorObj.b), 
-                    opacity: 0.35,
-                    blendMode: BlendMode.Multiply
-                });
-
-                // 2. 列印友善:只在文字下方畫底線 (不壓到文字)
-                // PDF 座標系原點在左下,h.y 就是文字的 baseline (文字往上畫),
-                // 所以把底線畫在 baseline 下方一點點,就不會壓到文字
-                if (h.printFriendly) {
+                    // 1. 螢光筆色塊
                     p.drawRectangle({
-                        x: h.x,
-                        y: h.y - 1.5,       // baseline 下方 1.5pt
-                        width: h.w,
-                        height: 1.2,        // 底線粗度
-                        color: rgb(0, 0, 0),
-                        opacity: 1
+                        x: h.x, y: h.y, width: h.w, height: h.h,
+                        color: rgb(c.r, c.g, c.b),
+                        opacity: 0.35,
+                        blendMode: BlendMode.Multiply
                     });
-                }
+
+                    // 2. 列印友善:只在文字下方畫底線 (不壓到文字)
+                    // PDF 座標系原點在左下,h.y 就是文字的 baseline,底線畫在 baseline 下方一點點
+                    if (batch.printFriendly) {
+                        p.drawRectangle({
+                            x: h.x,
+                            y: h.y - 1.5,
+                            width: h.w,
+                            height: 1.2,
+                            color: rgb(0, 0, 0),
+                            opacity: 1
+                        });
+                    }
+                });
             });
 
             const pdfBytes = await pdfDocLib.save();
-            downloadBlob(pdfBytes, "Highlighted_Document.pdf");
+            downloadBlob(pdfBytes, (originalFileName || "Document") + "_標記.pdf");
             updateStatus("匯出成功!", false);
         } catch (err) {
             console.error(err);
