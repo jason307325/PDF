@@ -5,7 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PDF 強效標記工具 (螢光筆 + 列印友善版)</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-    <script src="https://unpkg.com/pdf-lib/dist/pdf-lib.min.js"></script>
+    <!-- 鎖定版本：unpkg 不指定版本會拿到最新版，哪天改了 API 工具就壞掉 -->
+    <script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
     <style>
         body { font-family: "Microsoft JhengHei", sans-serif; margin: 0; background: #323639; color: white; }
         #controls {
@@ -17,6 +18,13 @@
         #pdf-container { display: flex; flex-direction: column; align-items: center; padding: 20px; background: #525659;}
         .page-wrapper { position: relative; margin-bottom: 25px; background: white; border: 1px solid #000; box-shadow: 0 4px 8px rgba(0,0,0,0.3);}
         canvas { display: block; }
+        /* 還沒畫出來的頁面先顯示頁碼，捲到附近才真的渲染 */
+        .page-wrapper::before {
+            content: attr(data-label); position: absolute; inset: 0;
+            display: flex; align-items: center; justify-content: center;
+            color: #bbb; font-size: 18px; pointer-events: none;
+        }
+        .page-wrapper.rendered::before { display: none; }
 
         .highlight-box {
             position: absolute;
@@ -63,6 +71,7 @@
             line-height: 1; cursor: pointer; border-radius: 50%;
         }
         .chip button:hover { color: #fff; background: #c0392b; }
+        .chip button.jump { font-size: 12px; }
     </style>
 </head>
 <body>
@@ -89,7 +98,11 @@
 
 <script>
     const pdfjsLib = window['pdfjs-dist/build/pdf'];
-    pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+    if (!pdfjsLib) {
+        document.getElementById("status").innerText = "PDF 核心程式載入失敗，請確認網路連線後重新整理。";
+    } else {
+        pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+    }
 
     const SCALE = 1.5;
     let originalPdfBytes = null;
@@ -109,11 +122,58 @@
         { pdf: {r:0.9, g:0.8, b:0}, css: "rgba(230, 200, 0, 0.45)",  dot: "rgb(230,200,0)" }
     ];
 
+    /* ==================== 延遲渲染 ====================
+     * 秩序冊常常上百頁。以前是一口氣把每一頁都畫成 canvas，
+     * 100 頁 × 1.5 倍解析度大約要吃掉 400MB 以上的記憶體，手機（尤其 iPhone）會直接閃退。
+     * 現在改成：文字先全部抽出來（搜尋只需要文字），畫面則是捲到附近才畫、捲遠了就釋放。 */
+    const pageObserver = new IntersectionObserver((entries) => {
+        entries.forEach(en => {
+            const rec = en.target._rec;
+            if (!rec) return;
+            if (en.isIntersecting) paintPage(rec);
+            else unpaintPage(rec);
+        });
+    }, { rootMargin: "1200px 0px" });   // 上下各多預先畫 1200px，捲動時不會看到空白
+
+    async function paintPage(rec) {
+        if (rec.painted || rec.painting) return;
+        rec.painting = true;
+        try {
+            const page = await pdfDoc.getPage(rec.pageNum);
+            const { canvas, viewport } = rec;
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+            const task = page.render({ canvasContext: canvas.getContext("2d"), viewport });
+            rec.renderTask = task;
+            await task.promise;
+            rec.painted = true;
+            rec.wrapper.classList.add("rendered");
+        } catch (err) {
+            if (err?.name !== "RenderingCancelledException") console.error(err);
+        } finally {
+            rec.painting = false;
+            rec.renderTask = null;
+        }
+    }
+
+    function unpaintPage(rec) {
+        if (rec.renderTask) rec.renderTask.cancel();
+        if (!rec.painted) return;
+        rec.canvas.width = 0;      // 把 canvas 的記憶體還給瀏覽器
+        rec.canvas.height = 0;
+        rec.painted = false;
+        rec.wrapper.classList.remove("rendered");
+    }
+
     document.getElementById("fileInput").addEventListener("change", async (e) => {
         const file = e.target.files[0];
-        if (!file) return;
-        updateStatus("讀取並渲染 PDF 中...", false);
+        if (!file || !pdfjsLib) return;
+        updateStatus("讀取 PDF 中...", false);
         try {
+            // 換檔案時把舊的釋放掉
+            pageObserver.disconnect();
+            if (pdfDoc) { try { await pdfDoc.destroy(); } catch {} }
+
             originalPdfBytes = await file.arrayBuffer();
             originalFileName = file.name.replace(/\.pdf$/i, "");
             const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(originalPdfBytes.slice(0)) });
@@ -125,7 +185,8 @@
             colorIndex = 0;
             renderLegend();
             for (let i = 1; i <= pdfDoc.numPages; i++) {
-                await renderPage(i);
+                await preparePage(i);
+                if (i % 5 === 0 || i === pdfDoc.numPages) updateStatus(`讀取文字中 ${i} / ${pdfDoc.numPages} 頁...`, false);
             }
             updateStatus(`載入完成,共 ${pdfDoc.numPages} 頁`, false);
         } catch (err) {
@@ -139,27 +200,30 @@
         if (e.key === "Enter") { e.preventDefault(); processSearch(); }
     });
 
-    async function renderPage(pageNum) {
+    // 只抽文字、建好版面，不畫圖；畫圖交給 pageObserver
+    async function preparePage(pageNum) {
         const page = await pdfDoc.getPage(pageNum);
         const viewport = page.getViewport({ scale: SCALE });
         const wrapper = document.createElement("div");
         wrapper.className = "page-wrapper";
+        wrapper.dataset.label = `第 ${pageNum} 頁`;
         wrapper.style.width = viewport.width + "px";
         wrapper.style.height = viewport.height + "px";
         const canvas = document.createElement("canvas");
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
+        canvas.width = 0; canvas.height = 0;
         wrapper.appendChild(canvas);
         const overlay = document.createElement("div");
         overlay.style.cssText = "position:absolute; inset:0; pointer-events:none;";
         wrapper.appendChild(overlay);
         document.getElementById("pdf-container").appendChild(wrapper);
-        await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
-        const textContent = await page.getTextContent();
 
+        const textContent = await page.getTextContent();
         // 把同一行的相鄰 items 合併成完整文字行,方便跨 item 的關鍵字比對
         const lines = buildLines(textContent.items, viewport);
-        pagesRecords.push({ pageNum, viewport, textContent, lines, overlay });
+        const rec = { pageNum, viewport, lines, overlay, wrapper, canvas, painted: false, painting: false, renderTask: null };
+        wrapper._rec = rec;
+        pagesRecords.push(rec);
+        pageObserver.observe(wrapper);
     }
 
     // 將 PDF.js 切碎的 text items 依 Y 軸位置合併成「行」
@@ -369,6 +433,7 @@
             h: Math.abs(item.transform[3]) || 12
         });
         batch.segs.push(seg);
+        if (batch.firstPage === null) batch.firstPage = page;
         highlightedSegs.set(seg, batch);
     }
 
@@ -388,7 +453,7 @@
             label: keywords.join("、"),
             color: COLOR_PALETTE[colorIndex % COLOR_PALETTE.length],
             printFriendly,
-            nodes: [], rects: [], segs: [], hits: 0
+            nodes: [], rects: [], segs: [], hits: 0, firstPage: null
         };
         let skipped = 0;
 
@@ -418,6 +483,11 @@
         updateStatus(`「${batch.label}」命中 ${batch.hits} 處 ${note},目前共 ${batches.length} 組標記`, false);
         document.getElementById("keywordInput").value = "";
         document.getElementById("keywordInput").focus();
+        jumpToBatch(batch);   // 自動捲到第一個命中的地方
+    }
+
+    function jumpToBatch(batch) {
+        if (batch.firstPage) batch.firstPage.wrapper.scrollIntoView({ behavior: "smooth", block: "start" });
     }
 
     function removeBatch(id) {
@@ -455,11 +525,16 @@
             text.textContent = b.label + " ";
             const small = document.createElement("small");
             small.textContent = `${b.hits} 處`;
+            const jump = document.createElement("button");
+            jump.className = "jump";
+            jump.textContent = "⤵";
+            jump.title = "跳到第一個標記";
+            jump.onclick = () => jumpToBatch(b);
             const btn = document.createElement("button");
             btn.textContent = "✕";
             btn.title = "移除這組標記";
             btn.onclick = () => removeBatch(b.id);
-            chip.append(dot, text, small, btn);
+            chip.append(dot, text, small, jump, btn);
             legend.appendChild(chip);
         });
     }
@@ -470,7 +545,7 @@
         try {
             if (typeof window.PDFLib === 'undefined') throw new Error("PDF 處理核心尚未載入完成。");
             const { PDFDocument, rgb, BlendMode } = window.PDFLib;
-            const pdfDocLib = await PDFDocument.load(new Uint8Array(originalPdfBytes.slice(0)));
+            const pdfDocLib = await PDFDocument.load(new Uint8Array(originalPdfBytes.slice(0)), { ignoreEncryption: true });
             const pages = pdfDocLib.getPages();
 
             batches.forEach(batch => {
